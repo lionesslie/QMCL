@@ -1,245 +1,222 @@
-"""QMCL — Game launcher: build JVM command and launch via subprocess."""
+"""QMCL — Game launcher: resolve version profile, build command, launch."""
 from __future__ import annotations
 
-import json
 import os
-import platform
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import Callable, Optional
 
-from core.constants import (
-    VERSIONS_DIR, LIBRARIES_DIR, ASSETS_DIR,
-    required_java,
+from api.mojang import (
+    _rules_allow, library_artifact, load_local_version, required_java_for,
 )
-from core.instances import Instance
 from core.accounts import Account
-from core.java_manager import find_java, download_java
+from core.constants import ASSETS_DIR, LIBRARIES_DIR, VERSIONS_DIR
+from core.instances import Instance
+from core.java_manager import download_java, find_java
+from core.settings import get_settings
+
+StatusCb = Optional[Callable[[str], None]]
+ProgressCb = Optional[Callable[[int], None]]
+
+_CP_SEP = ";" if sys.platform == "win32" else ":"
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 
-def _classpath_sep() -> str:
-    return ";" if sys.platform == "win32" else ":"
+# ── Version profile resolution (inheritsFrom) ─────────────────────────────────
+
+def _lib_key(lib: dict) -> str:
+    """group:artifact[:classifier] — identifies a library regardless of version."""
+    parts = lib.get("name", "").split(":")
+    key = ":".join(parts[:2])
+    if len(parts) > 3:
+        key += ":" + parts[3]
+    return key
 
 
-def _get_classpath(version_id: str) -> str:
-    """Collect all library JARs + client JAR into classpath string."""
-    info_file = VERSIONS_DIR / version_id / f"{version_id}.json"
-    if not info_file.exists():
-        raise FileNotFoundError(f"Version JSON missing: {info_file}")
+def load_merged_version(version_id: str, _depth: int = 0) -> dict:
+    """Load a version JSON and merge it with everything it inherits from."""
+    if _depth > 5:
+        raise RuntimeError("inheritsFrom chain too deep")
+    info = load_local_version(version_id)
+    parent_id = info.get("inheritsFrom")
+    if not parent_id:
+        info["_jar_id"] = version_id
+        return info
 
-    with info_file.open("r") as f:
-        info = json.load(f)
+    parent = load_merged_version(parent_id, _depth + 1)
+    merged = dict(parent)
+    for k, v in info.items():
+        if k not in ("libraries", "arguments", "inheritsFrom"):
+            merged[k] = v
 
-    jars: list[str] = []
+    libs: dict[str, dict] = {}
+    for lib in parent.get("libraries", []) + info.get("libraries", []):
+        libs[_lib_key(lib)] = lib          # child overrides parent version
+    merged["libraries"] = list(libs.values())
 
-    for lib in info.get("libraries", []):
-        downloads = lib.get("downloads", {})
-        artifact = downloads.get("artifact")
-        if artifact:
-            path = LIBRARIES_DIR / artifact["path"]
-            if path.exists():
-                jars.append(str(path))
-
-    client_jar = VERSIONS_DIR / version_id / f"{version_id}.jar"
-    if client_jar.exists():
-        jars.append(str(client_jar))
-
-    # Check for parent version (Fabric/Quilt/Forge profiles inherit)
-    inherits = info.get("inheritsFrom")
-    if inherits:
-        jars = _get_classpath(inherits).split(_classpath_sep()) + jars
-
-    return _classpath_sep().join(jars)
-
-
-def _resolve_args(args, instance: Instance, account: Account,
-                  version_info: dict, natives_dir: Path,
-                  asset_index_id: str) -> list[str]:
-    """Resolve ${variable} placeholders in argument lists."""
-    mc_dir = instance.resolve_directory()
-    width = 854
-    height = 480
-
-    vars_map = {
-        "auth_player_name": account.username,
-        "version_name": instance.mc_version,
-        "game_directory": str(mc_dir),
-        "assets_root": str(ASSETS_DIR),
-        "assets_index_name": asset_index_id,
-        "auth_uuid": account.uuid,
-        "auth_access_token": account.access_token or "offline",
-        "clientid": account.client_token,
-        "auth_xuid": account.xuid or "",
-        "user_type": "msa" if account.is_microsoft() else "legacy",
-        "version_type": "release",
-        "natives_directory": str(natives_dir),
-        "launcher_name": "QMCL",
-        "launcher_version": "1.0.0",
-        "classpath": _get_classpath(instance.mc_version),
-        "resolution_width": str(width),
-        "resolution_height": str(height),
+    pa, ca = parent.get("arguments", {}), info.get("arguments", {})
+    merged["arguments"] = {
+        "game": pa.get("game", []) + ca.get("game", []),
+        "jvm": pa.get("jvm", []) + ca.get("jvm", []),
     }
+    merged["_jar_id"] = parent["_jar_id"]
+    return merged
 
-    result: list[str] = []
+
+def _classpath(info: dict) -> str:
+    jars: list[str] = []
+    for lib in info.get("libraries", []):
+        if not _rules_allow(lib.get("rules")):
+            continue
+        art = library_artifact(lib)
+        if not art:
+            continue
+        path = LIBRARIES_DIR / art[0]
+        if path.exists():
+            jars.append(str(path))
+    jar_id = info["_jar_id"]
+    client = VERSIONS_DIR / jar_id / f"{jar_id}.jar"
+    if not client.exists():
+        raise FileNotFoundError(f"Client JAR missing: {client}")
+    jars.append(str(client))
+    return _CP_SEP.join(jars)
+
+
+# ── Argument resolution ───────────────────────────────────────────────────────
+
+def _expand(args: list, variables: dict[str, str]) -> list[str]:
+    out: list[str] = []
+
+    def sub(text: str) -> str:
+        for k, v in variables.items():
+            text = text.replace("${" + k + "}", v)
+        return text
+
     for arg in args:
         if isinstance(arg, str):
-            for k, v in vars_map.items():
-                arg = arg.replace(f"${{{k}}}", v)
-            result.append(arg)
+            out.append(sub(arg))
         elif isinstance(arg, dict):
-            rules = arg.get("rules", [])
-            from api.mojang import _rules_allow
-            if not _rules_allow(rules):
+            if not _rules_allow(arg.get("rules")):
                 continue
             val = arg.get("value", [])
-            if isinstance(val, str):
-                val = [val]
-            for v in val:
-                for k, rep in vars_map.items():
-                    v = v.replace(f"${{{k}}}", rep)
-                result.append(v)
+            out.extend(sub(v) for v in ([val] if isinstance(val, str) else val))
+    return out
 
-    return result
+
+def _resolve_java(instance: Instance, info: dict,
+                  status_cb: StatusCb, progress_cb: ProgressCb) -> str:
+    if instance.java_path and Path(instance.java_path).exists():
+        return instance.java_path
+    global_java = get_settings().get("java_path", "")
+    if global_java and Path(global_java).exists():
+        return global_java
+
+    major = int(info.get("javaVersion", {}).get("majorVersion")
+                or required_java_for(instance.mc_version))
+    java = find_java(major)
+    if java:
+        return java
+    if status_cb:
+        status_cb(f"Downloading Java {major}…")
+    java = download_java(major, progress_cb, status_cb)
+    if not java:
+        raise RuntimeError(
+            f"Java {major} is required but could not be found or downloaded. "
+            "Set a Java path in Settings.")
+    return java
 
 
 def build_launch_command(instance: Instance, account: Account,
-                         status_cb: Optional[Callable[[str], None]] = None,
-                         progress_cb: Optional[Callable[[int], None]] = None,
-                         ) -> list[str]:
-    """Build the full JVM + Minecraft command list."""
-    version_id = instance.mc_version
-    info_file = VERSIONS_DIR / version_id / f"{version_id}.json"
+                         status_cb: StatusCb = None,
+                         progress_cb: ProgressCb = None) -> list[str]:
+    version_id = instance.launch_version_id()
+    info = load_merged_version(version_id)
 
-    if not info_file.exists():
-        raise FileNotFoundError(
-            f"Version {version_id} not installed. Please install it first.")
+    java = _resolve_java(instance, info, status_cb, progress_cb)
 
-    with info_file.open("r") as f:
-        info = json.load(f)
-
-    # resolve inheritance
-    if "inheritsFrom" in info:
-        parent_id = info["inheritsFrom"]
-        parent_file = VERSIONS_DIR / parent_id / f"{parent_id}.json"
-        if not parent_file.exists():
-            raise FileNotFoundError(f"Parent version {parent_id} not installed.")
-        with parent_file.open("r") as f:
-            parent = json.load(f)
-        # merge: child overrides parent
-        merged = dict(parent)
-        merged.update(info)
-        # merge arguments separately
-        if "arguments" in parent and "arguments" in info:
-            for key in ("game", "jvm"):
-                merged["arguments"][key] = (
-                    parent["arguments"].get(key, []) +
-                    info["arguments"].get(key, [])
-                )
-        info = merged
-
-    # Java
-    java = instance.java_path or ""
-    if not java:
-        req = required_java(version_id)
-        java = find_java(req) or ""
-    if not java:
-        if status_cb:
-            status_cb("Downloading Java…")
-        req = required_java(version_id)
-        java = download_java(req, progress_cb, status_cb) or "java"
-
-    natives_dir = VERSIONS_DIR / version_id / "natives"
+    jar_id = info["_jar_id"]
+    natives_dir = VERSIONS_DIR / jar_id / "natives"
     natives_dir.mkdir(parents=True, exist_ok=True)
+    asset_index = info.get("assetIndex", {}).get("id", jar_id)
+    game_dir = instance.resolve_directory()
 
-    asset_index = info.get("assetIndex", {}).get("id", version_id)
+    classpath = _classpath(info)
+    variables = {
+        "auth_player_name": account.username,
+        "version_name": version_id,
+        "game_directory": str(game_dir),
+        "assets_root": str(ASSETS_DIR),
+        "assets_index_name": asset_index,
+        "auth_uuid": account.uuid.replace("-", ""),
+        "auth_access_token": account.access_token or "0",
+        "clientid": account.client_token,
+        "auth_xuid": account.xuid or "0",
+        "user_type": "msa" if account.is_microsoft() else "legacy",
+        "version_type": info.get("type", "release"),
+        "natives_directory": str(natives_dir),
+        "launcher_name": "QMCL",
+        "launcher_version": "1.0.0",
+        "classpath": classpath,
+        "classpath_separator": _CP_SEP,
+        "library_directory": str(LIBRARIES_DIR),
+        "game_assets": str(ASSETS_DIR / "virtual" / "legacy"),
+        "user_properties": "{}",
+        "resolution_width": "854",
+        "resolution_height": "480",
+    }
 
-    # JVM args
-    jvm_default = [
-        f"-Xmx{instance.ram_mb}M",
-        f"-Xms{min(512, instance.ram_mb)}M",
-        f"-Djava.library.path={natives_dir}",
-        f"-Dminecraft.launcher.brand=QMCL",
-        f"-Dminecraft.launcher.version=1.0.0",
-    ]
-    if sys.platform == "darwin":
-        jvm_default.append("-XstartOnFirstThread")
-
-    if instance.jvm_args:
-        jvm_default += instance.jvm_args.split()
-
-    # New-style arguments
     arguments = info.get("arguments", {})
-    game_args = arguments.get("game", [])
-    jvm_args_spec = arguments.get("jvm", [])
+    jvm_spec = arguments.get("jvm")
 
-    if jvm_args_spec:
-        extra_jvm = _resolve_args(jvm_args_spec, instance, account,
-                                  info, natives_dir, asset_index)
-        jvm_default += extra_jvm
+    jvm: list[str] = [f"-Xmx{instance.ram_mb}M",
+                      f"-Xms{min(512, instance.ram_mb)}M"]
+    if sys.platform == "darwin":
+        jvm.append("-XstartOnFirstThread")
+    if instance.jvm_args:
+        jvm += shlex.split(instance.jvm_args, posix=(sys.platform != "win32"))
+
+    if jvm_spec:
+        jvm += _expand(jvm_spec, variables)
+    else:                                   # pre-1.13 versions
+        jvm += [f"-Djava.library.path={natives_dir}",
+                "-Dminecraft.launcher.brand=QMCL",
+                "-Dminecraft.launcher.version=1.0.0",
+                "-cp", classpath]
+
+    if arguments.get("game"):
+        game = _expand(arguments["game"], variables)
     else:
-        # Old-style
-        jvm_default += [
-            f"-cp", _get_classpath(version_id),
-        ]
-
-    main_class = info.get("mainClass", "net.minecraft.client.main.Main")
-
-    game_resolved = _resolve_args(game_args, instance, account,
-                                  info, natives_dir, asset_index)
-
-    # Handle old minecraftArguments
-    if not game_args:
-        old_args = info.get("minecraftArguments", "")
-        if old_args:
-            for token in old_args.split():
-                for k, v in {
-                    "auth_player_name": account.username,
-                    "version_name": version_id,
-                    "game_directory": str(instance.resolve_directory()),
-                    "assets_root": str(ASSETS_DIR),
-                    "assets_index_name": asset_index,
-                    "auth_uuid": account.uuid,
-                    "auth_access_token": account.access_token or "offline",
-                    "user_type": "msa" if account.is_microsoft() else "legacy",
-                }.items():
-                    token = token.replace(f"${{{k}}}", v)
-                game_resolved.append(token)
-
-    cmd = [java] + jvm_default + [main_class] + game_resolved
+        game = _expand(info.get("minecraftArguments", "").split(), variables)
 
     if instance.extra_args:
-        cmd += instance.extra_args.split()
+        game += shlex.split(instance.extra_args, posix=(sys.platform != "win32"))
 
-    return cmd
+    main_class = info.get("mainClass", "net.minecraft.client.main.Main")
+    return [java] + jvm + [main_class] + game
 
 
 def launch(instance: Instance, account: Account,
-           status_cb: Optional[Callable[[str], None]] = None,
-           progress_cb: Optional[Callable[[int], None]] = None,
-           ) -> subprocess.Popen:
-    """Build command, then launch Minecraft. Returns Popen handle."""
+           status_cb: StatusCb = None,
+           progress_cb: ProgressCb = None) -> subprocess.Popen:
     if status_cb:
         status_cb("Building launch command…")
-
     cmd = build_launch_command(instance, account, status_cb, progress_cb)
 
     if status_cb:
         status_cb("Launching Minecraft…")
-
-    mc_dir = instance.resolve_directory()
-    mc_dir.mkdir(parents=True, exist_ok=True)
+    game_dir = instance.resolve_directory()
+    game_dir.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
-    env["_JAVA_OPTIONS"] = ""   # prevent double-flagging
+    env.pop("_JAVA_OPTIONS", None)
 
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(mc_dir),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    return proc
+    log = (game_dir / "qmcl-launch.log").open("w", encoding="utf-8")
+    log.write("COMMAND:\n" + " ".join(shlex.quote(c) for c in cmd[:1]) +
+              f" ... ({len(cmd)} args)\n\n")
+    log.flush()
+    return subprocess.Popen(
+        cmd, cwd=str(game_dir), env=env,
+        stdout=log, stderr=subprocess.STDOUT,
+        creationflags=_NO_WINDOW)

@@ -38,6 +38,20 @@ class Instance:
             return Path(self.directory)
         return INSTANCES_DIR / self.id
 
+    def launch_version_id(self) -> str:
+        """Version-profile id that is actually launched (loader-aware)."""
+        lv = self.loader_version
+        if lv:
+            if self.loader == "fabric":
+                return f"fabric-loader-{lv}-{self.mc_version}"
+            if self.loader == "quilt":
+                return f"quilt-loader-{lv}-{self.mc_version}"
+            if self.loader == "forge":
+                return f"{self.mc_version}-forge-{lv}"
+            if self.loader == "neoforge":
+                return f"neoforge-{lv}"
+        return self.mc_version
+
     def mods_dir(self) -> Path:
         return self.resolve_directory() / "mods"
 

@@ -9,7 +9,17 @@ from PySide6.QtWidgets import (
 )
 
 from ui.icons import get_icon
+from ui.widgets.remote_image import RemoteImage
 from ui.workers import SimpleWorker
+
+
+def _cover_url(data: dict) -> str:
+    """Best available cover image URL for a Modrinth / CurseForge hit."""
+    url = data.get("icon_url")
+    if url:
+        return url
+    logo = data.get("logo") or {}
+    return logo.get("thumbnailUrl") or logo.get("url") or ""
 
 
 class _ModCard(QWidget):
@@ -20,7 +30,7 @@ class _ModCard(QWidget):
         super().__init__(parent)
         self.setObjectName("GlassCard")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setFixedHeight(100)
+        self.setFixedHeight(104)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Fixed)
         self._data = data
@@ -30,18 +40,11 @@ class _ModCard(QWidget):
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(12)
 
-        # Icon placeholder
-        icon_frame = QFrame()
-        icon_frame.setFixedSize(52, 52)
-        icon_frame.setStyleSheet(
-            "background: rgba(108,99,255,0.1); border-radius: 10px;")
-        icon_inner = QVBoxLayout(icon_frame)
-        icon_inner.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_lbl = QLabel()
-        icon_lbl.setPixmap(
-            get_icon("puzzle-piece", "#6C63FF", 22).pixmap(22, 22))
-        icon_inner.addWidget(icon_lbl)
-        layout.addWidget(icon_frame)
+        # Cover image (Modrinth: icon_url, CurseForge: logo.thumbnailUrl)
+        self.cover = RemoteImage(size=68, radius=14)
+        self.cover.load(_cover_url(data))
+        layout.addWidget(self.cover,
+                         alignment=Qt.AlignmentFlag.AlignVCenter)
 
         # Text
         text_col = QVBoxLayout()
@@ -54,7 +57,7 @@ class _ModCard(QWidget):
             "background: transparent; border: none;")
         text_col.addWidget(name_lbl)
 
-        desc = data.get("description", "")
+        desc = data.get("description") or data.get("summary") or ""
         desc_lbl = QLabel(desc[:80] + ("…" if len(desc) > 80 else ""))
         desc_lbl.setStyleSheet(
             "color: #A0A0A8; font-size: 12px; "

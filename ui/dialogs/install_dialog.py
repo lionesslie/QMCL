@@ -87,72 +87,76 @@ class InstallDialog(QDialog):
         self._status_lbl.setText(text)
 
     def run_install(self) -> None:
-        """Start installation in background thread."""
-        from api.mojang import install_version
+        """Start installation in a background thread."""
+        from api.mojang import install_version, required_java_for, _scaled
         from api.loaders import (
-            install_fabric, install_quilt,
-            install_forge, install_neoforge,
-            get_fabric_versions, get_quilt_versions,
+            get_fabric_versions, get_quilt_versions, pick_stable,
+            get_forge_versions, get_neoforge_versions,
+            install_fabric, install_quilt, install_forge, install_neoforge,
         )
         from core.instances import get_instance_manager
         from core.java_manager import find_java, download_java
-        from core.constants import required_java
 
         inst = self.instance
 
-        def _install(progress_cb=None, status_cb=None):
-            # 1. Base Minecraft
-            install_version(inst.mc_version, progress_cb, status_cb)
-
-            # 2. Loader
-            java = inst.java_path or ""
-            if not java:
-                req = required_java(inst.mc_version)
-                java = find_java(req) or ""
+        def _java_for_installer(status_cb, progress_cb) -> str:
+            major = required_java_for(inst.mc_version)
+            java = inst.java_path or find_java(major)
             if not java:
                 if status_cb:
-                    status_cb("Downloading Java…")
-                req = required_java(inst.mc_version)
-                java = download_java(req, progress_cb, status_cb) or "java"
+                    status_cb(f"Downloading Java {major}…")
+                java = download_java(major, progress_cb, status_cb)
+            if not java:
+                raise RuntimeError(f"Java {major} could not be found or downloaded.")
+            return java
 
-            if inst.loader == "fabric":
-                versions = get_fabric_versions(inst.mc_version)
-                lv = (inst.loader_version
-                      or (versions[0]["loader"]["version"]
-                          if versions else ""))
-                if lv:
-                    install_fabric(inst.mc_version, lv, java,
-                                   progress_cb, status_cb)
-                    inst.loader_version = lv
+        def _install(progress_cb=None, status_cb=None):
+            # 1) vanilla Minecraft  → 0-85 % of the bar
+            install_version(inst.mc_version, _scaled(progress_cb, 0, 85), status_cb)
 
-            elif inst.loader == "quilt":
-                versions = get_quilt_versions(inst.mc_version)
-                lv = (inst.loader_version
-                      or (versions[0]["loader"]["version"]
-                          if versions else ""))
-                if lv:
-                    install_quilt(inst.mc_version, lv, java,
-                                  progress_cb, status_cb)
-                    inst.loader_version = lv
+            # 2) mod loader         → 85-100 % of the bar
+            lp = _scaled(progress_cb, 85, 100)
+            loader = inst.loader
+            if loader == "fabric":
+                lv = inst.loader_version or pick_stable(
+                    get_fabric_versions(inst.mc_version))
+                if not lv:
+                    raise RuntimeError(
+                        f"No Fabric loader available for {inst.mc_version}.")
+                install_fabric(inst.mc_version, lv, "", lp, status_cb)
+                inst.loader_version = lv
 
-            elif inst.loader == "forge":
-                from api.loaders import get_forge_versions
+            elif loader == "quilt":
+                lv = inst.loader_version or pick_stable(
+                    get_quilt_versions(inst.mc_version))
+                if not lv:
+                    raise RuntimeError(
+                        f"No Quilt loader available for {inst.mc_version}.")
+                install_quilt(inst.mc_version, lv, "", lp, status_cb)
+                inst.loader_version = lv
+
+            elif loader == "forge":
                 versions = get_forge_versions(inst.mc_version)
                 lv = inst.loader_version or (versions[0] if versions else "")
-                if lv:
-                    install_forge(inst.mc_version, lv, java,
-                                  progress_cb, status_cb)
-                    inst.loader_version = lv
+                if not lv:
+                    raise RuntimeError(
+                        f"No Forge build available for {inst.mc_version}.")
+                java = _java_for_installer(status_cb, progress_cb)
+                install_forge(inst.mc_version, lv, java, lp, status_cb)
+                inst.loader_version = lv
 
-            elif inst.loader == "neoforge":
-                from api.loaders import get_neoforge_versions
+            elif loader == "neoforge":
                 versions = get_neoforge_versions(inst.mc_version)
                 lv = inst.loader_version or (versions[0] if versions else "")
-                if lv:
-                    install_neoforge(inst.mc_version, lv, java,
-                                     progress_cb, status_cb)
-                    inst.loader_version = lv
+                if not lv:
+                    raise RuntimeError(
+                        f"No NeoForge build available for {inst.mc_version}.")
+                java = _java_for_installer(status_cb, progress_cb)
+                install_neoforge(inst.mc_version, lv, java, lp, status_cb)
+                inst.loader_version = lv
 
+            if progress_cb:
+                progress_cb(100)
             inst.installed = True
             get_instance_manager().update(inst)
             return True

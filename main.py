@@ -9,10 +9,17 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+def resource_path(*parts: str):
+    """Resolve bundled resources in dev mode and in a PyInstaller bundle."""
+    from pathlib import Path
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base.joinpath(*parts)
+
+
 def main() -> int:
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import Qt, QThreadPool
-    from PySide6.QtGui import QFont, QFontDatabase
+    from PySide6.QtGui import QFont, QFontDatabase, QIcon
 
     app = QApplication(sys.argv)
     app.setApplicationName("QMCL")
@@ -33,6 +40,9 @@ def main() -> int:
         app.setFont(QFont("Segoe UI", 10))
 
     from ui.main_window import MainWindow
+    icon_file = resource_path("assets", "icons", "app_icon.png")
+    if icon_file.exists():
+        app.setWindowIcon(QIcon(str(icon_file)))
     window = MainWindow()
     window.show()
 
@@ -44,7 +54,7 @@ def _load_fonts() -> None:
     from PySide6.QtGui import QFontDatabase
     from pathlib import Path
 
-    fonts_dir = Path(__file__).parent / "assets" / "fonts"
+    fonts_dir = resource_path("assets", "fonts")
     if fonts_dir.exists():
         for f in fonts_dir.glob("*.ttf"):
             QFontDatabase.addApplicationFont(str(f))

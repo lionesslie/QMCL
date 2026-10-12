@@ -16,30 +16,27 @@ from core.constants import ADOPTIUM_API, JAVA_DIR
 
 def _run(cmd: list[str]) -> Optional[str]:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                           if sys.platform == "win32" else 0)
         return r.stdout.strip() or r.stderr.strip()
     except Exception:
         return None
 
 
 def detect_java_version(java_path: str) -> Optional[int]:
-    """Return major version (8, 11, 17, 21…) or None."""
+    """Return major version (8, 11, 17, 21, 25…) or None."""
+    import re
     out = _run([java_path, "-version"])
     if not out:
         return None
-    # e.g. 'openjdk version "17.0.9" 2023-10-17'
-    for token in out.split():
-        token = token.strip('"')
-        if "." in token:
-            parts = token.split(".")
-            try:
-                major = int(parts[0])
-                if major == 1:          # old-style 1.8.x
-                    major = int(parts[1])
-                return major
-            except ValueError:
-                continue
-    return None
+    m = re.search(r'version "(\d+)(?:\.(\d+))?', out)
+    if not m:
+        return None
+    major = int(m.group(1))
+    if major == 1 and m.group(2):          # old style 1.8.x
+        major = int(m.group(2))
+    return major
 
 
 def find_java(required_major: int = 8) -> Optional[str]:
@@ -47,11 +44,11 @@ def find_java(required_major: int = 8) -> Optional[str]:
     candidates: list[str] = []
 
     # 1) QMCL-managed runtimes
-    for jre_dir in JAVA_DIR.iterdir() if JAVA_DIR.exists() else []:
-        if sys.platform == "win32":
-            candidates.append(str(jre_dir / "bin" / "java.exe"))
-        else:
-            candidates.append(str(jre_dir / "bin" / "java"))
+    exe_name = "java.exe" if sys.platform == "win32" else "java"
+    if JAVA_DIR.exists():
+        for exe in JAVA_DIR.rglob(exe_name):
+            if exe.parent.name == "bin":
+                candidates.append(str(exe))
 
     # 2) PATH
     import shutil
@@ -88,7 +85,11 @@ def find_java(required_major: int = 8) -> Optional[str]:
         if not Path(c).exists():
             continue
         ver = detect_java_version(c)
-        if ver and ver >= required_major and ver > best_major:
+        if not ver or ver < required_major:
+            continue
+        if ver == required_major:
+            return c
+        if best is None or ver < best_major:
             best = c
             best_major = ver
 
