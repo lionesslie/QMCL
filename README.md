@@ -1,4 +1,4 @@
-# QMCL — Quantum Minecraft Launcher
+# QMCL — Minecraft Launcher
 
 A production-ready, modern Minecraft launcher built with Python 3.11+ and PySide6.  
 Glassmorphism dark UI · Microsoft OAuth · Multi-instance · Modrinth & CurseForge · Real game launch
